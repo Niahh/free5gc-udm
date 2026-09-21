@@ -3,12 +3,12 @@ package consumer
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 
+	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
 	Nnrf_NFDiscovery "github.com/free5gc/openapi/nrf/NFDisc"
 	Nnrf_NFManagement "github.com/free5gc/openapi/nrf/NFMgmt"
@@ -16,7 +16,12 @@ import (
 	"github.com/free5gc/udm/internal/logger"
 	"github.com/free5gc/udm/internal/util"
 	sbi_metrics "github.com/free5gc/util/metrics/sbi"
+	"github.com/free5gc/util/nfheartbeat"
 )
+
+// registerRetryInterval is the wait between two NFRegister attempts while the NRF
+// is unreachable.
+const registerRetryInterval = 2 * time.Second
 
 type nnrfService struct {
 	consumer *Consumer
@@ -26,6 +31,14 @@ type nnrfService struct {
 
 	nfMngmntClients map[string]*Nnrf_NFManagement.APIClient
 	nfDiscClients   map[string]*Nnrf_NFDiscovery.APIClient
+
+	heartbeat *nfheartbeat.Runner
+
+	// heartbeatTimer is the interval in seconds last assigned in a registration
+	// response; PATCH-adopted values live in the Runner. Set by the startup
+	// registration before the heartbeat goroutine starts, then only rewritten
+	// from re-registrations on that same goroutine.
+	heartbeatTimer int32
 }
 
 func (s *nnrfService) getNFManagementClient(uri string) *Nnrf_NFManagement.APIClient {
@@ -143,61 +156,122 @@ func (s *nnrfService) SendDeregisterNFInstance() (err error) {
 	return err
 }
 
-func (s *nnrfService) RegisterNFInstance(ctx context.Context) (
-	resouceNrfUri string, retrieveNfInstanceID string, err error,
-) {
+// RegisterNFInstance registers the NF profile with the NRF, retrying until it
+// succeeds or ctx is canceled. applyOAuth2 must be true only for the startup
+// registration: it writes OAuth2Required, which SBI handlers read concurrently
+// once the server is running.
+//
+// The profile keeps udmContext.NfId: NFRegister is a PUT on the instance ID the
+// UDM chose, per 3GPP TS 29.510 clause 6.1.3.2.2.
+func (s *nnrfService) RegisterNFInstance(ctx context.Context, applyOAuth2 bool) error {
 	udmContext := s.consumer.Context()
 	client := s.getNFManagementClient(udmContext.NrfUri)
+	if client == nil {
+		return errors.Errorf("RegisterNFInstance: nrf not found")
+	}
+
 	nfProfile, err := s.buildNfProfile(udmContext)
 	if err != nil {
-		return "", "", errors.Wrap(err, "RegisterNFInstance buildNfProfile()")
+		return errors.Wrap(err, "RegisterNFInstance buildNfProfile()")
 	}
-	var registerNfInstanceRequest Nnrf_NFManagement.RegisterNFInstanceRequest
-	registerNfInstanceRequest.NfInstanceID = &udmContext.NfId
-	registerNfInstanceRequest.RequestBody = &nfProfile
+
 	var res *Nnrf_NFManagement.RegisterNFInstanceResponse
-	for {
+	registerNfInstanceRequest := &Nnrf_NFManagement.RegisterNFInstanceRequest{
+		NfInstanceID: &udmContext.NfId,
+		RequestBody:  &nfProfile,
+	}
+	for ctx.Err() == nil {
+		res, err = client.NFInstanceIDDocumentApi.RegisterNFInstance(ctx, registerNfInstanceRequest)
+		if err == nil && res != nil {
+			var nf models.Nrf_NFMgmt_NFProfile
+			if res.Nrf_NFMgmt_NFProfile != nil {
+				nf = *res.Nrf_NFMgmt_NFProfile
+			}
+			s.processRegisterResponse(udmContext, nf, applyOAuth2)
+			return nil
+		}
+		logger.ConsumerLog.Errorf("UDM register to NRF Error[%v]", err)
 		select {
 		case <-ctx.Done():
-			return "", "", errors.Errorf("Context Cancel before RegisterNFInstance")
-		default:
-		}
-
-		res, err = client.NFInstanceIDDocumentApi.RegisterNFInstance(ctx, &registerNfInstanceRequest)
-
-		if err != nil || res == nil {
-			logger.ConsumerLog.Errorf("UDM register to NRF Error[%v]", err)
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		if res.Location == "" {
-			// NFUpdate
-			break
-		} else { // http.statusCreated
-			// NFRegister
-			resourceUri := res.Location
-			resouceNrfUri = resourceUri[:strings.Index(resourceUri, "/nnrf-nfm/")]
-			retrieveNfInstanceID = resourceUri[strings.LastIndex(resourceUri, "/")+1:]
-
-			oauth2 := false
-			if res.Nrf_NFMgmt_NFProfile != nil {
-				customInfo, ok := res.Nrf_NFMgmt_NFProfile.CustomInfo.(map[string]interface{})
-				v, isBool := customInfo["oauth2"].(bool)
-				if ok && isBool {
-					oauth2 = v
-					logger.MainLog.Infoln("OAuth2 setting receive from NRF:", oauth2)
-				}
-			}
-			udm_context.GetSelf().OAuth2Required = oauth2
-			if oauth2 && udm_context.GetSelf().NrfCertPem == "" {
-				logger.CfgLog.Error("OAuth2 enable but no nrfCertPem provided in config.")
-			}
-
-			break
+		case <-time.After(registerRetryInterval):
 		}
 	}
-	return resouceNrfUri, retrieveNfInstanceID, err
+	return errors.Errorf("Context Cancel before RegisterNFInstance")
+}
+
+// processRegisterResponse adopts what the NRF answered to the NFRegister PUT: the
+// heartbeat interval and the oauth2 custom info.
+func (s *nnrfService) processRegisterResponse(
+	udmContext *udm_context.UDMContext,
+	nf models.Nrf_NFMgmt_NFProfile,
+	applyOAuth2 bool,
+) {
+	s.heartbeatTimer = nf.HeartBeatTimer
+
+	oauth2 := false
+	if customInfo, ok := nf.CustomInfo.(map[string]interface{}); ok {
+		if v, isBool := customInfo["oauth2"].(bool); isBool {
+			oauth2 = v
+			logger.MainLog.Infoln("OAuth2 setting receive from NRF:", oauth2)
+		}
+	}
+	if applyOAuth2 {
+		udmContext.OAuth2Required = oauth2
+		if oauth2 && udmContext.NrfCertPem == "" {
+			logger.CfgLog.Error("OAuth2 enable but no nrfCertPem provided in config.")
+		}
+	} else if oauth2 != udmContext.OAuth2Required {
+		logger.ConsumerLog.Warnf("NRF OAuth2 setting changed to %v, restart UDM to apply it", oauth2)
+	}
+}
+
+// SendUpdateNFInstance sends an NFUpdate PATCH to the NRF, honoring ctx. The
+// raw err comes back alongside any ProblemDetails so callers can read its
+// GenericOpenAPIError status.
+func (s *nnrfService) SendUpdateNFInstance(ctx context.Context, patchItem []models.PatchItem) (
+	nf models.Nrf_NFMgmt_NFProfile, problemDetails *models.ProblemDetails, err error,
+) {
+	udmContext := s.consumer.Context()
+	tokCtx, pd, err := udmContext.GetTokenCtx(
+		models.Nrf_NFMgmt_ServiceName_NNRF_NFM,
+		models.Nrf_NFMgmt_NFType_NRF,
+	)
+	if err != nil {
+		return nf, pd, err
+	}
+	// GetTokenCtx takes no parent, so the token request stays uncancellable;
+	// transplanting the token lets at least the PATCH honor ctx.
+	if tok := tokCtx.Value(openapi.ContextOAuth2); tok != nil {
+		ctx = context.WithValue(ctx, openapi.ContextOAuth2, tok)
+	}
+
+	client := s.getNFManagementClient(udmContext.NrfUri)
+	if client == nil {
+		return nf, nil, errors.Errorf("SendUpdateNFInstance: nrf not found")
+	}
+
+	request := &Nnrf_NFManagement.UpdateNFInstanceRequest{
+		NfInstanceID: &udmContext.NfId,
+		RequestBody:  patchItem,
+	}
+
+	res, err := client.NFInstanceIDDocumentApi.UpdateNFInstance(ctx, request)
+	if err != nil {
+		var apiErr openapi.GenericOpenAPIError
+		if errors.As(err, &apiErr) {
+			if updateErr, okModel := apiErr.Model().(Nnrf_NFManagement.UpdateNFInstanceError); okModel {
+				return nf, updateErr.ProblemDetails, err
+			}
+		}
+		return nf, nil, err
+	}
+	if res == nil {
+		return nf, nil, errors.Errorf("empty NFUpdate response")
+	}
+	if res.Nrf_NFMgmt_NFProfile != nil {
+		nf = *res.Nrf_NFMgmt_NFProfile
+	}
+	return nf, nil, nil
 }
 
 func (s *nnrfService) buildNfProfile(udmContext *udm_context.UDMContext) (
